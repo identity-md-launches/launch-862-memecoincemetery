@@ -80,7 +80,7 @@ contract MemecoinCemetery {
         uint256 length = bytes(epitaph).length;
         if (length == 0 || length > 140) revert InvalidEpitaphLength(length);
         if (token.code.length == 0) revert InvalidToken(token);
-        (bool ok, uint256 supply) = _readUint(token, abi.encodeWithSelector(TOTAL_SUPPLY));
+        (bool ok, uint256 supply) = _readUint(token, abi.encodeWithSelector(TOTAL_SUPPLY), READ_GAS);
         if (!ok || supply == 0) revert InvalidToken(token);
 
         // All token interactions are STATICCALLs: callbacks cannot mutate cemetery state.
@@ -193,23 +193,26 @@ contract MemecoinCemetery {
 
     /// @notice Render the current headstone as standalone SVG; reverts for undug tokens.
     /// @dev Dates are Gregorian UTC. All untrusted text is XML-escaped. Unsupported symbol
-    /// responses (including empty or non-ASCII strings) use a shortened address.
+    /// responses (including empty, non-ASCII or over-32-byte strings) use a shortened address.
     /// @param token The token whose headstone should be rendered.
     /// @return svg The SVG document, including a rise count banner only in state Risen.
     function headstone(address token) external view returns (string memory svg) {
         Grave storage grave = graves[token];
         if (grave.state == State.None) revert NeverDug(token);
         string memory sealDate = grave.state == State.Buried || grave.state == State.Risen ? _date(grave.sealedAt) : "-";
+        string memory symbol = _symbol(token);
         svg = string.concat(
             '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600">',
             '<rect width="800" height="600" fill="#101719"/>',
             '<path d="M100 550V210a300 180 0 0 1 600 0v340Z" fill="#67716d" stroke="#a4ada5" stroke-width="8"/>',
             '<g text-anchor="middle" fill="#101719" font-family="monospace">',
             '<text x="400" y="130" font-size="32">R.I.P.</text>',
-            '<text x="400" y="205" font-size="28" textLength="520" lengthAdjust="spacingAndGlyphs">',
-            _escape(_symbol(token)),
+            '<text x="400" y="205" font-size="28"',
+            bytes(symbol).length > 30 ? ' textLength="520" lengthAdjust="spacingAndGlyphs">' : ">",
+            _escape(symbol),
             "</text>",
-            '<text x="400" y="310" font-size="20" textLength="540" lengthAdjust="spacingAndGlyphs">',
+            '<text x="400" y="310" font-size="20"',
+            bytes(grave.epitaph).length > 45 ? ' textLength="540" lengthAdjust="spacingAndGlyphs">' : ">",
             _escape(grave.epitaph),
             "</text>",
             '<text x="400" y="385" font-size="20">Dug: ',
@@ -239,24 +242,28 @@ contract MemecoinCemetery {
 
     /// @dev Enforce max(1, min(10**decimals, totalSupply/1000)) using current token data.
     /// Malformed decimals, reverts and values above 36 default to 18; required reads fail closed.
+    /// Callers fund required reads so expensive balance/supply calculations do not exclude holders.
     function _requireHolder(address token, address account) private view {
-        (bool ok, uint256 supply) = _readUint(token, abi.encodeWithSelector(TOTAL_SUPPLY));
+        (bool ok, uint256 supply) = _readUint(token, abi.encodeWithSelector(TOTAL_SUPPLY), gasleft());
         if (!ok) revert TokenReadFailed(token, TOTAL_SUPPLY);
-        (bool hasDecimals, uint256 decimals) = _readUint(token, abi.encodeWithSelector(DECIMALS));
+        (bool hasDecimals, uint256 decimals) = _readUint(token, abi.encodeWithSelector(DECIMALS), READ_GAS);
         if (!hasDecimals || decimals > 36) decimals = 18;
         uint256 wholeToken = 10 ** decimals;
         uint256 threshold = supply / 1000;
         if (threshold > wholeToken) threshold = wholeToken;
         if (threshold == 0) threshold = 1;
-        (bool hasBalance, uint256 balance) = _readUint(token, abi.encodeWithSelector(BALANCE_OF, account));
+        (bool hasBalance, uint256 balance) = _readUint(token, abi.encodeWithSelector(BALANCE_OF, account), gasleft());
         if (!hasBalance) revert TokenReadFailed(token, BALANCE_OF);
         if (balance < threshold) revert NotHolder(token, account, threshold);
     }
 
-    /// @dev Read exactly one ABI word with fixed gas and output limits, including on failure.
+    /// @dev Read exactly one ABI word with the supplied gas limit and a fixed output limit.
     /// STATICCALL prevents state-changing reentrancy; bounded copying prevents return-data bombs.
-    function _readUint(address token, bytes memory input) private view returns (bool ok, uint256 value) {
-        uint256 gasLimit = READ_GAS;
+    function _readUint(address token, bytes memory input, uint256 gasLimit)
+        private
+        view
+        returns (bool ok, uint256 value)
+    {
         assembly ("memory-safe") {
             ok := staticcall(gasLimit, token, add(input, 32), mload(input), 0, 32)
             ok := and(ok, eq(returndatasize(), 32))
@@ -265,7 +272,7 @@ contract MemecoinCemetery {
     }
 
     /// @dev Validate the ABI header before allocating or copying a symbol.
-    /// The fixed gas cap bounds the callee's return-data memory; claimed lengths are never trusted.
+    /// The gas cap bounds callee memory; the 32-byte length limit also bounds rendering work.
     function _symbol(address token) private view returns (string memory) {
         bytes memory input = abi.encodeWithSelector(SYMBOL);
         uint256 gasLimit = READ_GAS;
@@ -282,7 +289,7 @@ contract MemecoinCemetery {
                 length := mload(32)
             }
         }
-        if (!ok || size < 64 || offset != 32 || length == 0) {
+        if (!ok || size < 64 || offset != 32 || length == 0 || length > 32) {
             return _shortAddress(token);
         }
         // Round available data down to full ABI words, avoiding arithmetic on a hostile length.
