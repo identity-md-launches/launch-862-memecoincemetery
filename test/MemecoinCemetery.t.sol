@@ -11,6 +11,7 @@ interface CemeteryVm {
     function prank(address sender) external;
     function deal(address account, uint256 balance) external;
     function etch(address account, bytes calldata code) external;
+    function cool(address target) external;
     function expectRevert(bytes calldata reason) external;
     function expectEmit(bool topic1, bool topic2, bool topic3, bool data, address emitter) external;
 }
@@ -33,6 +34,36 @@ contract CemeteryToken {
 
     function setSupply(uint256 supply) external {
         totalSupply = supply;
+    }
+}
+
+// Reflection-style balances derive their rate by walking excluded accounts.
+// The excluded accounts hold zero tokens, so the holder owns the entire supply.
+contract CemeteryReflectionToken {
+    uint256 public totalSupply = 1_000_000e18;
+    uint8 public constant decimals = 18;
+    uint256 private reflectedSupply;
+    mapping(address => uint256) private reflectedBalances;
+    mapping(address => uint256) private excludedBalances;
+    address[] private excluded;
+
+    constructor(address holder) {
+        reflectedSupply = totalSupply * 1e9;
+        reflectedBalances[holder] = reflectedSupply;
+        for (uint160 i = 1; i <= 10; ++i) {
+            excluded.push(address(i));
+        }
+    }
+
+    function balanceOf(address account) external view returns (uint256) {
+        uint256 reflected = reflectedSupply;
+        uint256 supply = totalSupply;
+        for (uint256 i; i < excluded.length; ++i) {
+            address excludedAccount = excluded[i];
+            reflected -= reflectedBalances[excludedAccount];
+            supply -= excludedBalances[excludedAccount];
+        }
+        return reflectedBalances[account] / (reflected / supply);
     }
 }
 
@@ -581,6 +612,45 @@ contract MemecoinCemeteryTest is CemeteryTestTools {
         _requiredReadFailures(true);
     }
 
+    function _proveGasHeavyBalance(CemeteryReflectionToken target) internal {
+        bytes memory input = abi.encodeCall(target.balanceOf, (HOLDER));
+        vm.cool(address(target));
+        (bool capped,) = address(target).staticcall{gas: 50_000}(input);
+        require(!capped, "fixture must exceed the old holder-read cap");
+        vm.cool(address(target));
+        (bool funded, bytes memory data) = address(target).staticcall{gas: 200_000}(input);
+        require(funded, "funded balance read failed");
+        _eq(abi.decode(data, (uint256)), 1_000_000e18, "holder must own the entire supply");
+        // Prior probes and setup must not warm storage for the cemetery's read.
+        vm.cool(address(target));
+    }
+
+    function test_GasHeavyReflectionHolderCanSave() public {
+        CemeteryReflectionToken target = new CemeteryReflectionToken(HOLDER);
+        _dig(address(target), "Expensive does not mean dead");
+        _proveGasHeavyBalance(target);
+        vm.prank(HOLDER);
+        cemetery.itLives{gas: 300_000}(address(target));
+        MemecoinCemetery.Grave memory saved = _grave(cemetery, address(target));
+        require(saved.state == MemecoinCemetery.State.Saved, "gas-heavy holder could not save");
+        _eq(saved.saves, 1, "save not counted");
+        _eq(cemetery.graveCount(), 0, "saved token counted as buried");
+    }
+
+    function test_GasHeavyReflectionHolderCanRise() public {
+        CemeteryReflectionToken target = new CemeteryReflectionToken(HOLDER);
+        _bury(address(target));
+        MemecoinCemetery.Burial memory record = cemetery.burialOf(address(target), 1);
+        _proveGasHeavyBalance(target);
+        vm.prank(HOLDER);
+        cemetery.rise{gas: 300_000}(address(target));
+        MemecoinCemetery.Grave memory risen = _grave(cemetery, address(target));
+        require(risen.state == MemecoinCemetery.State.Risen, "gas-heavy holder could not rise");
+        _eq(risen.rises, 1, "rise not counted");
+        _eq(cemetery.graveCount(), 0, "risen token counted as buried");
+        _sameBurial(cemetery.burialOf(address(target), 1), record);
+    }
+
     function _requiredReadFailures(bool buried) internal {
         CemeteryProbeToken probe = _probe();
         if (buried) _bury(address(probe));
@@ -593,6 +663,8 @@ contract MemecoinCemeteryTest is CemeteryTestTools {
             for (uint256 i; i < 7; ++i) {
                 bytes memory response = i < 3 ? new bytes(i == 0 ? 0 : i == 1 ? 31 : 64) : abi.encode(uint256(1e18));
                 CemeteryProbeToken.Mode mode = i < 3 ? CemeteryProbeToken.Mode.Reply : CemeteryProbeToken.Mode(i - 2);
+                // Holder reads are caller-funded; do not require a cap for an infinite loop.
+                if (mode == CemeteryProbeToken.Mode.ExhaustGas) continue;
                 probe.configure(selectors[j], response, mode);
                 _callMustRevert(
                     address(probe),
